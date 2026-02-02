@@ -1815,8 +1815,6 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                             const temp_reg = try self.allocTempGeneral();
                             var copied: u32 = 0;
                             while (copied < elem_size) : (copied += 8) {
-                                const chunk_size: u32 = @min(8, elem_size - copied);
-                                _ = chunk_size;
                                 if (comptime builtin.cpu.arch == .aarch64) {
                                     try self.codegen.emit.ldrRegMemSoff(.w64, temp_reg, addr_reg, @intCast(copied));
                                     try self.codegen.emit.strRegMemSoff(.w64, temp_reg, .FP, result_slot + @as(i32, @intCast(copied)));
@@ -3333,7 +3331,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                     if (args.len != 2) unreachable;
                     const list_loc = try self.generateExpr(args[0]);
                     const needle_loc = try self.generateExpr(args[1]);
-                    return try self.generateListContains(list_loc, needle_loc, ll);
+                    return try self.generateListContains(list_loc, needle_loc);
                 },
                 .list_reverse => {
                     // list_reverse(list) -> List
@@ -3360,17 +3358,13 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                 .list_split_first => {
                     // list_split_first(list) -> {element, List}
                     // Returns the first element and the rest of the list
-                    if (args.len != 1) unreachable;
-                    const list_loc = try self.generateExpr(args[0]);
-                    _ = list_loc;
-                    unreachable; // Complex: returns a record/tuple
+                    // TODO: Complex - returns a record/tuple
+                    unreachable;
                 },
                 .list_split_last => {
                     // list_split_last(list) -> {List, element}
-                    if (args.len != 1) unreachable;
-                    const list_loc = try self.generateExpr(args[0]);
-                    _ = list_loc;
-                    unreachable; // Complex: returns a record/tuple
+                    // TODO: Complex - returns a record/tuple
+                    unreachable;
                 },
 
                 // ── Integer-to-integer try conversions ──
@@ -4008,23 +4002,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
         }
 
         /// Generate list_contains: linear scan comparing each element
-        fn generateListContains(self: *Self, list_loc: ValueLocation, needle_loc: ValueLocation, ll: anytype) Error!ValueLocation {
-            const ls = self.layout_store orelse unreachable;
-
-            // Get element size from the list's element layout
-            // list_contains args: [list, element], the element layout comes from the list type
-            const args_span = self.store.getExprSpan(ll.args);
-            _ = args_span;
-
-            // We know the list contains elements of the same type as the needle
-            const needle_size: u32 = blk: {
-                const ret_layout = ls.getLayout(ll.ret_layout);
-                _ = ret_layout; // return type is bool, not helpful
-                // We need to figure out element size from the list arg's layout
-                // For now, assume the needle fits in a register (<=8 bytes)
-                break :blk 8;
-            };
-            _ = needle_size;
+        fn generateListContains(self: *Self, list_loc: ValueLocation, needle_loc: ValueLocation) Error!ValueLocation {
 
             const list_base: i32 = switch (list_loc) {
                 .stack => |off| off,
@@ -4318,8 +4296,6 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                 const copy_tmp = try self.allocTempGeneral();
                 var off: u32 = 0;
                 while (off < elem_size_align.size) : (off += 8) {
-                    const chunk = @min(8, elem_size_align.size - off);
-                    _ = chunk;
                     if (comptime builtin.cpu.arch == .aarch64) {
                         try self.codegen.emit.ldrRegMemSoff(.w64, copy_tmp, src_addr, @intCast(off));
                         try self.codegen.emit.strRegMemSoff(.w64, copy_tmp, dst_addr, @intCast(off));
@@ -4962,11 +4938,11 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             const freg = self.codegen.allocFloat() orelse return Error.NoRegisterToSpill;
             if (comptime builtin.cpu.arch == .aarch64) {
                 // aarch64: f64 returned in D0
-                try self.codegen.emit.fmovRegReg(.double, freg, @enumFromInt(0));
+                try self.codegen.emit.fmovRegReg(.double, freg, .V0);
             } else {
                 // x86_64: f64 returned in XMM0
-                if (freg != @as(FloatReg, @enumFromInt(0))) {
-                    try self.codegen.emit.movsdRegReg(freg, @enumFromInt(0));
+                if (freg != .XMM0) {
+                    try self.codegen.emit.movsdRegReg(freg, .XMM0);
                 }
             }
             return .{ .float_reg = freg };
@@ -4977,15 +4953,15 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
         fn callF64ToI128(self: *Self, freg: FloatReg, fn_addr: usize) Error!ValueLocation {
             if (comptime builtin.cpu.arch == .aarch64) {
                 // f64 argument in D0
-                if (freg != @as(FloatReg, @enumFromInt(0))) {
-                    try self.codegen.emit.fmovRegReg(.double, @enumFromInt(0), freg);
+                if (freg != .V0) {
+                    try self.codegen.emit.fmovRegReg(.double, .V0, freg);
                 }
                 try self.codegen.emitLoadImm(.X9, @intCast(fn_addr));
                 try self.codegen.emit.blrReg(.X9);
             } else {
                 // f64 argument in XMM0
-                if (freg != @as(FloatReg, @enumFromInt(0))) {
-                    try self.codegen.emit.movsdRegReg(@enumFromInt(0), freg);
+                if (freg != .XMM0) {
+                    try self.codegen.emit.movsdRegReg(.XMM0, freg);
                 }
                 try self.codegen.emit.movRegImm64(.R11, @intCast(fn_addr));
                 try self.codegen.emit.callReg(.R11);
@@ -5359,8 +5335,8 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                         if (comptime builtin.cpu.arch == .aarch64) {
                             try self.codegen.emit.movRegImm64(.X0, @bitCast(@as(i64, result_offset)));
                             try self.codegen.emit.addRegRegReg(.w64, .X0, .FP, .X0);
-                            if (freg != @as(FloatReg, @enumFromInt(0))) {
-                                try self.codegen.emit.fmovRegReg(.double, @enumFromInt(0), freg);
+                            if (freg != .V0) {
+                                try self.codegen.emit.fmovRegReg(.double, .V0, freg);
                             }
                             try self.codegen.emitLoadImm(.X1, @intCast(target_bits));
                             try self.codegen.emitLoadImm(.X2, @intCast(target_is_signed));
@@ -5369,8 +5345,8 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                             try self.codegen.emit.blrReg(.X9);
                         } else {
                             try self.codegen.emit.leaRegMem(.RDI, .RBP, result_offset);
-                            if (freg != @as(FloatReg, @enumFromInt(0))) {
-                                try self.codegen.emit.movsdRegReg(@enumFromInt(0), freg);
+                            if (freg != .XMM0) {
+                                try self.codegen.emit.movsdRegReg(.XMM0, freg);
                             }
                             try self.codegen.emitLoadImm(.RSI, @intCast(target_bits));
                             try self.codegen.emitLoadImm(.RDX, @intCast(target_is_signed));
@@ -5416,15 +5392,15 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                         if (comptime builtin.cpu.arch == .aarch64) {
                             try self.codegen.emit.movRegImm64(.X0, @bitCast(@as(i64, result_offset)));
                             try self.codegen.emit.addRegRegReg(.w64, .X0, .FP, .X0);
-                            if (freg != @as(FloatReg, @enumFromInt(0))) {
-                                try self.codegen.emit.fmovRegReg(.double, @enumFromInt(0), freg);
+                            if (freg != .V0) {
+                                try self.codegen.emit.fmovRegReg(.double, .V0, freg);
                             }
                             try self.codegen.emitLoadImm(.X9, @intCast(fn_addr));
                             try self.codegen.emit.blrReg(.X9);
                         } else {
                             try self.codegen.emit.leaRegMem(.RDI, .RBP, result_offset);
-                            if (freg != @as(FloatReg, @enumFromInt(0))) {
-                                try self.codegen.emit.movsdRegReg(@enumFromInt(0), freg);
+                            if (freg != .XMM0) {
+                                try self.codegen.emit.movsdRegReg(.XMM0, freg);
                             }
                             try self.codegen.emit.movRegImm64(.R11, @intCast(fn_addr));
                             try self.codegen.emit.callReg(.R11);
@@ -6560,13 +6536,11 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             const result_reg = try self.allocTempGeneral();
             try self.codegen.emitLoadImm(result_reg, 1); // Start with "all equal"
 
-            const fields_range = record_data.fields;
             var field_i: u32 = 0;
             while (field_i < field_count) : (field_i += 1) {
                 const field_offset = ls.getRecordFieldOffset(record_idx, @intCast(field_i));
                 const field_size = ls.getRecordFieldSize(record_idx, @intCast(field_i));
                 const field_layout_idx = ls.getRecordFieldLayout(record_idx, @intCast(field_i));
-                _ = fields_range;
 
                 const lhs_field_off = lhs_base + @as(i32, @intCast(field_offset));
                 const rhs_field_off = rhs_base + @as(i32, @intCast(field_offset));
@@ -10441,15 +10415,15 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                     return try self.dispatchEnumClosure(cv.stack_offset, repr.lambda_set, args_span, ret_layout);
                 },
                 .union_repr => |repr| {
-                    return try self.dispatchUnionClosure(cv.stack_offset, repr, args_span, ret_layout);
+                    return try self.dispatchUnionClosure(cv.stack_offset, repr, args_span);
                 },
                 .unwrapped_capture => {
                     // Single function - call directly with the captured value
-                    return try self.callSingleClosureWithCaptures(cv, args_span, ret_layout);
+                    return try self.callSingleClosureWithCaptures(cv, args_span);
                 },
                 .struct_captures => {
                     // Single function - call directly with captures struct
-                    return try self.callSingleClosureWithCaptures(cv, args_span, ret_layout);
+                    return try self.callSingleClosureWithCaptures(cv, args_span);
                 },
                 .direct_call => {
                     // Lambda that couldn't be compiled as proc (e.g., captures
@@ -10511,7 +10485,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
 
                     // Generate code for this branch
                     const result = try self.compileLambdaAndCall(member.lambda_body, args_span, ret_layout);
-                    try self.copyToStackSlot(result_slot, result, ret_layout);
+                    try self.copyToStackSlot(result_slot, result);
 
                     // Jump to end
                     try end_jumps.append(self.allocator, try self.codegen.emitJump());
@@ -10521,7 +10495,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                 } else {
                     // Last case - no comparison needed (fallthrough)
                     const result = try self.compileLambdaAndCall(member.lambda_body, args_span, ret_layout);
-                    try self.copyToStackSlot(result_slot, result, ret_layout);
+                    try self.copyToStackSlot(result_slot, result);
                 }
             }
 
@@ -10540,7 +10514,6 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             union_offset: i32,
             repr: anytype,
             args_span: anytype,
-            ret_layout: layout.Idx,
         ) Error!ValueLocation {
             const members = self.store.getLambdaSetMembers(repr.lambda_set);
 
@@ -10552,7 +10525,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                 // Single function - call with captures from payload
                 const member = members[0];
                 // Captures start at offset +8 (after tag with padding)
-                return try self.compileLambdaAndCallWithCaptures(member, union_offset + 8, args_span, ret_layout);
+                return try self.compileLambdaAndCallWithCaptures(member, union_offset + 8, args_span);
             }
 
             // Load tag from stack (stored as 64-bit value, tag is in low bits)
@@ -10575,8 +10548,8 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                     const skip_jump = try self.emitJumpIfNotEqual();
 
                     // Generate code for this branch (captures at +8 after tag with padding)
-                    const result = try self.compileLambdaAndCallWithCaptures(member, union_offset + 8, args_span, ret_layout);
-                    try self.copyToStackSlot(result_slot, result, ret_layout);
+                    const result = try self.compileLambdaAndCallWithCaptures(member, union_offset + 8, args_span);
+                    try self.copyToStackSlot(result_slot, result);
 
                     // Jump to end
                     try end_jumps.append(self.allocator, try self.codegen.emitJump());
@@ -10585,8 +10558,8 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                     self.codegen.patchJump(skip_jump, self.codegen.currentOffset());
                 } else {
                     // Last case - no comparison needed (fallthrough)
-                    const result = try self.compileLambdaAndCallWithCaptures(member, union_offset + 8, args_span, ret_layout);
-                    try self.copyToStackSlot(result_slot, result, ret_layout);
+                    const result = try self.compileLambdaAndCallWithCaptures(member, union_offset + 8, args_span);
+                    try self.copyToStackSlot(result_slot, result);
                 }
             }
 
@@ -10605,9 +10578,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             self: *Self,
             cv: anytype,
             args_span: anytype,
-            ret_layout: layout.Idx,
         ) Error!ValueLocation {
-            _ = ret_layout;
 
             // Bind captures from the closure's stack data to their symbols
             const captures = self.store.getCaptures(cv.captures);
@@ -10732,7 +10703,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             const result_slot = self.codegen.allocStackSlot(@intCast(result_size));
 
             // Store the normal return value to the result slot
-            try self.storeValueToStack(result_loc, result_slot, result_size, lambda.ret_layout);
+            try self.storeValueToStack(result_loc, result_slot, result_size);
 
             // Jump over the early return merge point (normal path continues here)
             const skip_merge_patch = try self.codegen.emitJump();
@@ -10755,7 +10726,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             self.early_return_ret_layout = saved_early_return_ret_layout;
 
             // Return the result from the stack slot
-            return self.locationForStackSlot(result_slot, result_size, lambda.ret_layout);
+            return self.locationForStackSlot(result_slot, lambda.ret_layout);
         }
 
         /// Compile a lambda body expression as a procedure and call it.
@@ -10791,9 +10762,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             member: mono.LambdaSetMember,
             captures_offset: i32,
             args_span: anytype,
-            ret_layout: layout.Idx,
         ) Error!ValueLocation {
-            _ = ret_layout;
 
             // Bind captures from the stack to their symbols
             const captures = self.store.getCaptures(member.captures);
@@ -10823,8 +10792,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
         }
 
         /// Copy a value location to a stack slot.
-        fn copyToStackSlot(self: *Self, slot: i32, loc: ValueLocation, ret_layout: layout.Idx) Error!void {
-            _ = ret_layout;
+        fn copyToStackSlot(self: *Self, slot: i32, loc: ValueLocation) Error!void {
             switch (loc) {
                 .general_reg => |reg| {
                     try self.codegen.emitStoreStack(.w64, slot, reg);
@@ -11520,8 +11488,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
         }
 
         /// Store a ValueLocation to a stack slot (FP-relative).
-        fn storeValueToStack(self: *Self, loc: ValueLocation, slot: i32, size: u32, layout_idx: layout.Idx) Error!void {
-            _ = layout_idx;
+        fn storeValueToStack(self: *Self, loc: ValueLocation, slot: i32, size: u32) Error!void {
             const temp_reg: GeneralReg = if (comptime builtin.cpu.arch == .aarch64) .X9 else .R11;
             const num_regs: u32 = (size + 7) / 8;
 
@@ -11603,8 +11570,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
         }
 
         /// Create a ValueLocation for a stack slot based on the type.
-        fn locationForStackSlot(self: *Self, slot: i32, size: u32, layout_idx: layout.Idx) ValueLocation {
-            _ = size;
+        fn locationForStackSlot(self: *Self, slot: i32, layout_idx: layout.Idx) ValueLocation {
             if (layout_idx == .str) return .{ .stack_str = slot };
             if (layout_idx == .i128 or layout_idx == .u128 or layout_idx == .dec) return .{ .stack_i128 = slot };
             if (self.layout_store) |ls| {
@@ -12362,11 +12328,7 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                 }
 
             } else {
-                // aarch64: Use existing approach (prologue emitted upfront)
-                // We need to emit prologue at the start, so we insert it before body_start
-                // For now, keep the simpler approach for aarch64
-
-                // Actually for aarch64, we should emit prologue first.
+                // aarch64: Prepend prologue to generated body
                 // Since body was generated without prologue, we need to prepend it.
                 const body_bytes = self.allocator.dupe(u8, self.codegen.emit.buf.items[body_start..body_end]) catch return Error.OutOfMemory;
                 defer self.allocator.free(body_bytes);
@@ -12381,6 +12343,41 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
                 try self.codegen.emit.stpPreIndex(.w64, .FP, .LR, .ZRSP, scaled_offset);
                 try self.codegen.emit.movRegReg(.w64, .FP, .ZRSP);
                 const prologue_size = self.codegen.currentOffset() - prologue_start;
+
+                // PHASE 2.5: Patch self-calls in body_bytes
+                // Self-calls target body_start but after prepending prologue,
+                // they need to target prologue_start which means adjusting
+                // the relative offset by -prologue_size.
+                // aarch64 BL: 1 00101 imm26 (4-byte instruction, imm26 is signed offset in words)
+                var i: usize = 0;
+                while (i + 4 <= body_bytes.len) : (i += 4) {
+                    const inst: u32 = @bitCast(body_bytes[i..][0..4].*);
+                    // Check for BL opcode (bits 31-26 = 100101 = 37)
+                    if ((inst >> 26) == 0b100101) {
+                        // Extract 26-bit signed offset (in words)
+                        const imm26: u26 = @truncate(inst);
+                        const offset_words: i26 = @bitCast(imm26);
+                        const offset_bytes: i32 = @as(i32, offset_words) * 4;
+                        // For aarch64, offset is relative to instruction address (not end like x86_64)
+                        const inst_offset: i64 = @intCast(i);
+                        const target: i64 = inst_offset + offset_bytes;
+                        if (target == @as(i64, @intCast(body_start))) {
+                            // This is a self-call targeting body_start
+                            // After prepending prologue, the instruction is at (prologue_size + i)
+                            // and should still target prologue_start (body_start)
+                            // New relative offset = body_start - (body_start + prologue_size + i)
+                            //                     = -(prologue_size + i)
+                            // Old relative offset = -(i)
+                            // Adjustment = new - old = -prologue_size
+                            const new_offset_bytes: i32 = offset_bytes - @as(i32, @intCast(prologue_size));
+                            const new_offset_words: i26 = @intCast(@divExact(new_offset_bytes, 4));
+                            const new_imm26: u26 = @bitCast(new_offset_words);
+                            const new_inst: u32 = (@as(u32, 0b100101) << 26) | new_imm26;
+                            const new_bytes: [4]u8 = @bitCast(new_inst);
+                            @memcpy(body_bytes[i..][0..4], &new_bytes);
+                        }
+                    }
+                }
 
                 // Re-append body
                 self.codegen.emit.buf.appendSlice(self.allocator, body_bytes) catch return Error.OutOfMemory;
