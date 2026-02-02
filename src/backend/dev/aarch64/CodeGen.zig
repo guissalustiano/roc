@@ -368,22 +368,15 @@ pub const AArch64CodeGen = struct {
 
     // Stack management
 
+    /// Allocate stack space using the deferred prologue pattern.
+    /// aarch64 uses FP-relative addressing with positive offsets growing upward from FP.
+    /// stack_offset starts at 16 (after saved FP/LR) and grows as we allocate.
+    /// Final frame size is determined by stack_offset after code generation.
     pub fn allocStack(self: *Self, size: u32) i32 {
         const aligned_size: i32 = @intCast((size + 15) & ~@as(u32, 15)); // 16-byte align
-
-        // For aarch64 procedure frames, stack_offset is positive and grows upward.
-        // We return the current offset and increment for the next allocation.
-        // For main expression frames, stack_offset is negative and grows downward.
-        if (self.stack_offset >= 0) {
-            // Procedure frame: return current offset, then increment
-            const offset = self.stack_offset;
-            self.stack_offset += aligned_size;
-            return offset;
-        } else {
-            // Main expression frame: decrement, then return (standard downward growth)
-            self.stack_offset -= aligned_size;
-            return self.stack_offset;
-        }
+        const offset = self.stack_offset;
+        self.stack_offset += aligned_size;
+        return offset;
     }
 
     /// Alias for allocStack - allocate a stack slot of the given size
@@ -391,8 +384,10 @@ pub const AArch64CodeGen = struct {
         return self.allocStack(size);
     }
 
+    /// Get the aligned stack size for the frame.
+    /// On aarch64, stack_offset is positive and represents total frame size from FP.
     pub fn getStackSize(self: *Self) u32 {
-        const size: u32 = @intCast(-self.stack_offset);
+        const size: u32 = @intCast(self.stack_offset);
         return (size + 15) & ~@as(u32, 15);
     }
 

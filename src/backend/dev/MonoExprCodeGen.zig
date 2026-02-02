@@ -953,9 +953,10 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
 
         /// Generate code for a Mono IR expression
         ///
-        /// The generated code follows the calling convention:
-        /// - First arg (RDI/X0) contains the pointer to the result buffer
-        /// - Second arg (RSI/X1) contains the pointer to RocOps
+        /// The generated code follows the RocCall ABI calling convention:
+        /// - First arg (RDI/X0) contains the pointer to RocOps
+        /// - Second arg (RSI/X1) contains the pointer to the result buffer
+        /// - Third arg (RDX/X2) contains the pointer to arguments (unused for main)
         /// - The function writes the result to the result buffer and returns
         ///
         /// For tuples, pass tuple_len > 1 to copy all elements to the result buffer.
@@ -976,16 +977,17 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             const main_code_start = self.codegen.currentOffset();
 
             // Reserve argument registers so they don't get allocated for temporaries
-            // X0/RDI = result pointer, X1/RSI = RocOps pointer
+            // X0/RDI = RocOps, X1/RSI = result pointer
             self.reserveArgumentRegisters();
 
-            // Emit prologue to save callee-saved registers we'll use (X19 for result ptr)
+            // Emit prologue to save callee-saved registers we'll use
             try self.emitMainPrologue();
 
-            // IMPORTANT: Save the result pointer and RocOps pointer to callee-saved registers
+            // IMPORTANT: Save the RocOps and result pointers to callee-saved registers
             // before generating code that might call procedures (which would clobber them).
-            // On aarch64: save X0 to X19, X1 to X20 (callee-saved)
-            // On x86_64: save RDI to RBX, RSI to R12 (callee-saved)
+            // RocCall ABI: arg0=roc_ops, arg1=ret_ptr, arg2=args_ptr
+            // On aarch64: save X0 (roc_ops) to X20, X1 (ret_ptr) to X19 (callee-saved)
+            // On x86_64: save RDI (roc_ops) to R12, RSI (ret_ptr) to RBX (callee-saved)
             const result_ptr_save_reg = if (comptime builtin.cpu.arch == .aarch64)
                 aarch64.GeneralReg.X19
             else
@@ -996,12 +998,14 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             else
                 x86_64.GeneralReg.R12;
 
-            try self.emitMovRegReg(result_ptr_save_reg, if (comptime builtin.cpu.arch == .aarch64)
+            // Save roc_ops (first arg) to callee-saved register
+            try self.emitMovRegReg(roc_ops_save_reg, if (comptime builtin.cpu.arch == .aarch64)
                 aarch64.GeneralReg.X0
             else
                 x86_64.GeneralReg.RDI);
 
-            try self.emitMovRegReg(roc_ops_save_reg, if (comptime builtin.cpu.arch == .aarch64)
+            // Save result pointer (second arg) to callee-saved register
+            try self.emitMovRegReg(result_ptr_save_reg, if (comptime builtin.cpu.arch == .aarch64)
                 aarch64.GeneralReg.X1
             else
                 x86_64.GeneralReg.RSI);
@@ -14948,6 +14952,9 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
         /// 5. Stores the result to ret_ptr
         /// 6. Returns void
         ///
+        /// Uses deferred prologue pattern: generates body first to determine
+        /// actual stack usage, then prepends prologue with exact size needed.
+        ///
         /// Returns the code offset where the wrapper function starts.
         pub fn generateEntrypointWrapper(
             self: *Self,
@@ -14957,9 +14964,6 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             ret_layout: layout.Idx,
         ) Error!ExportedSymbol {
             _ = name; // Used for the symbol name, passed through to result
-
-            // Record start position
-            const func_start = self.codegen.currentOffset();
 
             // Clear state for this entrypoint
             self.symbol_locations.clearRetainingCapacity();
@@ -14971,153 +14975,233 @@ pub fn MonoExprCodeGenFor(comptime CodeGen: type, comptime GeneralReg: type, com
             // aarch64 AAPCS64: X0=roc_ops, X1=ret_ptr, X2=args_ptr
 
             if (comptime builtin.cpu.arch == .aarch64) {
-                // Reserve space for callee-saved registers and locals
-                // FP and LR are saved by STP instruction
-                const frame_size: i32 = 64; // Space for saved regs + locals
-                const scaled_offset: i7 = @intCast(@divExact(-frame_size, 8));
-                try self.codegen.emit.stpPreIndex(.w64, .FP, .LR, .ZRSP, scaled_offset);
-                try self.codegen.emit.movRegReg(.w64, .FP, .ZRSP);
-
-                // Save RocOps pointer (X0) to callee-saved register X19
-                try self.codegen.emit.movRegReg(.w64, .X19, .X0);
-                // Save ret_ptr (X1) to callee-saved register X20
-                try self.codegen.emit.movRegReg(.w64, .X20, .X1);
-                // Save args_ptr (X2) to callee-saved register X21
-                try self.codegen.emit.movRegReg(.w64, .X21, .X2);
-
-                self.roc_ops_reg = .X19;
-
-                // Unpack arguments from args_ptr (X21) to argument registers
-                var args_offset: i32 = 0;
-                for (arg_layouts, 0..) |arg_layout, i| {
-                    const arg_size = self.getLayoutSize(arg_layout);
-                    const dest_reg = self.getArgumentRegister(@intCast(i));
-
-                    // Load from [X21 + args_offset]
-                    try self.codegen.emit.ldrRegMemSoff(.w64, dest_reg, .X21, args_offset);
-                    args_offset += @intCast(arg_size);
-                }
-
-                // Generate the body expression
-                const result_loc = try self.generateExpr(body_expr);
-
-                // If the body is a lambda or closure (function value), we need to CALL it, not return it.
-                // This happens when the entrypoint is defined as `main_for_host! = main!` where
-                // `main!` is a lambda/closure.
-                const final_result = switch (result_loc) {
-                    .lambda_code => |lc| blk: {
-                        // Call the lambda with BL instruction (aarch64)
-                        // Calculate relative offset from current position
-                        const current_offset = self.codegen.currentOffset();
-                        const rel_offset: i28 = @intCast(@as(i32, @intCast(lc.code_offset)) - @as(i32, @intCast(current_offset)));
-                        try self.codegen.emit.bl(rel_offset);
-
-                        // Result is in X0
-                        break :blk ValueLocation{ .general_reg = .X0 };
-                    },
-                    .closure_value => |cv| blk: {
-                        // Dispatch the closure call with no arguments
-                        const empty_span = mono.MonoIR.MonoExprSpan.empty();
-                        break :blk try self.generateClosureDispatch(cv, empty_span, ret_layout);
-                    },
-                    else => result_loc,
-                };
-
-                // Store result to ret_ptr (X20)
-                try self.storeResultToSavedPtr(final_result, ret_layout, .X20, 1);
-
-                // Epilogue: restore FP/LR and return
-                try self.codegen.emit.ldpPostIndex(.w64, .FP, .LR, .ZRSP, @intCast(@divExact(frame_size, 8)));
-                try self.codegen.emit.ret();
+                return self.generateEntrypointWrapperAarch64(body_expr, arg_layouts, ret_layout);
             } else {
-                // x86_64: emit prologue
-                try self.codegen.emit.pushReg(.RBP);
-                try self.codegen.emit.movRegReg(.w64, .RBP, .RSP);
+                return self.generateEntrypointWrapperX86_64(body_expr, arg_layouts, ret_layout);
+            }
+        }
 
-                // Save callee-saved registers we'll use
-                try self.codegen.emit.pushReg(.RBX); // Will hold ret_ptr
-                try self.codegen.emit.pushReg(.R12); // Will hold RocOps
-                try self.codegen.emit.pushReg(.R13); // Will hold args_ptr
+        /// x86_64 entrypoint with deferred prologue pattern
+        fn generateEntrypointWrapperX86_64(
+            self: *Self,
+            body_expr: MonoExprId,
+            arg_layouts: []const layout.Idx,
+            ret_layout: layout.Idx,
+        ) Error!ExportedSymbol {
+            // PHASE 1: Generate body first to determine stack usage
+            // We need space for:
+            // - 3 callee-saved registers we use (RBX, R12, R13) = 24 bytes at offsets -8, -16, -24
+            // - Local variables allocated during body generation
+            const CALLEE_SAVED_SIZE: i32 = 24; // 3 registers * 8 bytes
 
-                // Align stack to 16 bytes (we pushed 4 regs = 32 bytes, already aligned)
-                // Reserve space for locals
-                const local_space: i32 = 64;
-                try self.codegen.emit.subRegImm32(.w64, .RSP, @intCast(local_space));
+            // Initialize stack offset after callee-saved area
+            self.codegen.stack_offset = -CALLEE_SAVED_SIZE;
 
-                // Save RocOps pointer (RDI) to R12
-                try self.codegen.emit.movRegReg(.w64, .R12, .RDI);
-                // Save ret_ptr (RSI) to RBX
-                try self.codegen.emit.movRegReg(.w64, .RBX, .RSI);
-                // Save args_ptr (RDX) to R13
-                try self.codegen.emit.movRegReg(.w64, .R13, .RDX);
+            const body_start = self.codegen.currentOffset();
+            const relocs_before = self.codegen.relocations.items.len;
 
-                self.roc_ops_reg = .R12;
+            // Save incoming arguments to callee-saved registers
+            // These are emitted as part of the "body" but really they're setup code
+            // RDI=roc_ops -> R12, RSI=ret_ptr -> RBX, RDX=args_ptr -> R13
+            try self.codegen.emit.movRegReg(.w64, .R12, .RDI);
+            try self.codegen.emit.movRegReg(.w64, .RBX, .RSI);
+            try self.codegen.emit.movRegReg(.w64, .R13, .RDX);
 
-                // Initialize stack offset for code generation
-                self.codegen.stack_offset = -local_space;
+            self.roc_ops_reg = .R12;
 
-                // Unpack arguments from args_ptr (R13) to argument registers
-                // System V: RDI, RSI, RDX, RCX, R8, R9 for first 6 args
-                var args_offset: i32 = 0;
-                for (arg_layouts, 0..) |arg_layout, i| {
-                    const arg_size = self.getLayoutSize(arg_layout);
-                    const dest_reg = self.getArgumentRegister(@intCast(i));
+            // Unpack arguments from args_ptr (R13) to argument registers
+            // System V: RDI, RSI, RDX, RCX, R8, R9 for first 6 args
+            var args_offset: i32 = 0;
+            for (arg_layouts, 0..) |arg_layout, i| {
+                const arg_size = self.getLayoutSize(arg_layout);
+                const dest_reg = self.getArgumentRegister(@intCast(i));
 
-                    // Load from [R13 + args_offset]
-                    try self.codegen.emit.movRegMem(.w64, dest_reg, .R13, args_offset);
-                    args_offset += @intCast(arg_size);
-                }
+                // Load from [R13 + args_offset]
+                try self.codegen.emit.movRegMem(.w64, dest_reg, .R13, args_offset);
+                args_offset += @intCast(arg_size);
+            }
 
-                // Generate the body expression
-                std.debug.print("[ENTRYPOINT x86_64] Generating body expr {d}\n", .{@intFromEnum(body_expr)});
-                const body_mono_expr = self.store.getExpr(body_expr);
-                std.debug.print("[ENTRYPOINT x86_64] Body expr type: {s}\n", .{@tagName(body_mono_expr)});
-                const result_loc = try self.generateExpr(body_expr);
-                std.debug.print("[ENTRYPOINT x86_64] Result loc: {s}\n", .{@tagName(result_loc)});
+            // Generate the body expression
+            const result_loc = try self.generateExpr(body_expr);
 
-                // If the body is a lambda or closure (function value), we need to CALL it, not return it.
-                // This happens when the entrypoint is defined as `main_for_host! = main!` where
-                // `main!` is a lambda/closure. Evaluating the body gives us the function, but we need
-                // to invoke it to get the actual result.
-                const final_result = switch (result_loc) {
-                    .lambda_code => |lc| blk: {
-                        std.debug.print("[ENTRYPOINT x86_64] Body is lambda_code, calling at offset {d}\n", .{lc.code_offset});
-                        // Call the lambda with no arguments (entrypoint lambdas take no args)
-                        // The lambda's code is at lc.code_offset
-                        const rel_offset = @as(i32, @intCast(lc.code_offset)) - @as(i32, @intCast(self.codegen.currentOffset() + 5));
-                        try self.codegen.emit.callRel32(rel_offset);
+            // If the body is a lambda or closure (function value), we need to CALL it
+            const final_result = switch (result_loc) {
+                .lambda_code => |lc| blk: {
+                    const rel_offset = @as(i32, @intCast(lc.code_offset)) - @as(i32, @intCast(self.codegen.currentOffset() + 5));
+                    try self.codegen.emit.callRel32(rel_offset);
+                    break :blk ValueLocation{ .general_reg = .RAX };
+                },
+                .closure_value => |cv| blk: {
+                    const empty_span = mono.MonoIR.MonoExprSpan.empty();
+                    break :blk try self.generateClosureDispatch(cv, empty_span, ret_layout);
+                },
+                else => result_loc,
+            };
 
-                        // Result is in RAX (for small return values)
-                        break :blk ValueLocation{ .general_reg = .RAX };
-                    },
-                    .closure_value => |cv| blk: {
-                        std.debug.print("[ENTRYPOINT x86_64] Body is closure_value, dispatching\n", .{});
-                        // Dispatch the closure call with no arguments
-                        // Use an empty span - entrypoint functions take no user-visible args
-                        const empty_span = mono.MonoIR.MonoExprSpan.empty();
-                        break :blk try self.generateClosureDispatch(cv, empty_span, ret_layout);
-                    },
-                    else => result_loc,
-                };
+            // Store result to ret_ptr (RBX)
+            try self.storeResultToSavedPtr(final_result, ret_layout, .RBX, 1);
 
-                // Store result to ret_ptr (RBX)
-                try self.storeResultToSavedPtr(final_result, ret_layout, .RBX, 1);
+            // Emit epilogue (will be moved after prologue is prepended)
+            // Calculate actual stack size used (includes callee-saved area)
+            const stack_used: i32 = -self.codegen.stack_offset;
+            // Align to 16 bytes
+            const aligned_stack_size: i32 = (stack_used + 15) & ~@as(i32, 15);
+            // locals_size is what we actually sub/add to RSP (callee-saved regs handled by push/pop)
+            const locals_size: i32 = aligned_stack_size - CALLEE_SAVED_SIZE;
 
-                // Epilogue: deallocate locals, restore callee-saved, return
-                try self.codegen.emit.addRegImm32(.w64, .RSP, @intCast(local_space));
-                try self.codegen.emit.popReg(.R13);
-                try self.codegen.emit.popReg(.R12);
-                try self.codegen.emit.popReg(.RBX);
-                try self.codegen.emit.popReg(.RBP);
-                try self.codegen.emit.ret();
+            // Epilogue: deallocate locals (matching prologue's sub), restore callee-saved, return
+            if (locals_size > 0) {
+                try self.codegen.emit.addRegImm32(.w64, .RSP, locals_size);
+            }
+            try self.codegen.emit.popReg(.R13);
+            try self.codegen.emit.popReg(.R12);
+            try self.codegen.emit.popReg(.RBX);
+            try self.codegen.emit.popReg(.RBP);
+            try self.codegen.emit.ret();
+
+            const body_end = self.codegen.currentOffset();
+
+            // PHASE 2: Extract body and prepend prologue
+            const body_bytes = self.allocator.dupe(u8, self.codegen.emit.buf.items[body_start..body_end]) catch return Error.OutOfMemory;
+            defer self.allocator.free(body_bytes);
+
+            // Truncate buffer back to body_start
+            self.codegen.emit.buf.shrinkRetainingCapacity(body_start);
+
+            // Emit prologue
+            const prologue_start = self.codegen.currentOffset();
+            try self.codegen.emit.pushReg(.RBP);
+            try self.codegen.emit.movRegReg(.w64, .RBP, .RSP);
+
+            // Save callee-saved registers we use
+            try self.codegen.emit.pushReg(.RBX);
+            try self.codegen.emit.pushReg(.R12);
+            try self.codegen.emit.pushReg(.R13);
+
+            // Allocate stack space for locals (callee-saved regs handled by pushes above)
+            if (locals_size > 0) {
+                try self.codegen.emit.subRegImm32(.w64, .RSP, locals_size);
+            }
+
+            const prologue_size = self.codegen.currentOffset() - prologue_start;
+
+            // Re-append body
+            self.codegen.emit.buf.appendSlice(self.allocator, body_bytes) catch return Error.OutOfMemory;
+
+            // PHASE 3: Adjust relocation offsets
+            for (self.codegen.relocations.items[relocs_before..]) |*reloc| {
+                reloc.adjustOffset(prologue_size);
             }
 
             const func_end = self.codegen.currentOffset();
 
             return ExportedSymbol{
-                .name = "", // Caller should set this
-                .offset = func_start,
-                .size = func_end - func_start,
+                .name = "",
+                .offset = prologue_start,
+                .size = func_end - prologue_start,
+            };
+        }
+
+        /// aarch64 entrypoint with deferred prologue pattern
+        fn generateEntrypointWrapperAarch64(
+            self: *Self,
+            body_expr: MonoExprId,
+            arg_layouts: []const layout.Idx,
+            ret_layout: layout.Idx,
+        ) Error!ExportedSymbol {
+            // PHASE 1: Generate body first to determine stack usage
+            // aarch64 uses FP-relative addressing with positive offsets from FP
+            // FP and LR are saved by STP instruction (16 bytes)
+            // We also use X19, X20, X21 as callee-saved (saved manually)
+            const FP_LR_SIZE: i32 = 16;
+
+            // Initialize stack offset for FP-relative addressing
+            // First slot is at FP+16 (after saved FP/LR)
+            self.codegen.stack_offset = FP_LR_SIZE;
+
+            const body_start = self.codegen.currentOffset();
+            const relocs_before = self.codegen.relocations.items.len;
+
+            // Save incoming arguments to callee-saved registers
+            // X0=roc_ops -> X19, X1=ret_ptr -> X20, X2=args_ptr -> X21
+            try self.codegen.emit.movRegReg(.w64, .X19, .X0);
+            try self.codegen.emit.movRegReg(.w64, .X20, .X1);
+            try self.codegen.emit.movRegReg(.w64, .X21, .X2);
+
+            self.roc_ops_reg = .X19;
+
+            // Unpack arguments from args_ptr (X21) to argument registers
+            var args_offset: i32 = 0;
+            for (arg_layouts, 0..) |arg_layout, i| {
+                const arg_size = self.getLayoutSize(arg_layout);
+                const dest_reg = self.getArgumentRegister(@intCast(i));
+
+                // Load from [X21 + args_offset]
+                try self.codegen.emit.ldrRegMemSoff(.w64, dest_reg, .X21, args_offset);
+                args_offset += @intCast(arg_size);
+            }
+
+            // Generate the body expression
+            const result_loc = try self.generateExpr(body_expr);
+
+            // If the body is a lambda or closure, call it
+            const final_result = switch (result_loc) {
+                .lambda_code => |lc| blk: {
+                    const current_offset = self.codegen.currentOffset();
+                    const rel_offset: i28 = @intCast(@as(i32, @intCast(lc.code_offset)) - @as(i32, @intCast(current_offset)));
+                    try self.codegen.emit.bl(rel_offset);
+                    break :blk ValueLocation{ .general_reg = .X0 };
+                },
+                .closure_value => |cv| blk: {
+                    const empty_span = mono.MonoIR.MonoExprSpan.empty();
+                    break :blk try self.generateClosureDispatch(cv, empty_span, ret_layout);
+                },
+                else => result_loc,
+            };
+
+            // Store result to ret_ptr (X20)
+            try self.storeResultToSavedPtr(final_result, ret_layout, .X20, 1);
+
+            // Calculate actual frame size (must include FP/LR and be 16-byte aligned)
+            const stack_used: u32 = @intCast(self.codegen.stack_offset);
+            const frame_size: i32 = @intCast((stack_used + 15) & ~@as(u32, 15));
+
+            // Emit epilogue
+            const scaled_restore: i7 = @intCast(@divExact(frame_size, 8));
+            try self.codegen.emit.ldpPostIndex(.w64, .FP, .LR, .ZRSP, scaled_restore);
+            try self.codegen.emit.ret();
+
+            const body_end = self.codegen.currentOffset();
+
+            // PHASE 2: Extract body and prepend prologue
+            const body_bytes = self.allocator.dupe(u8, self.codegen.emit.buf.items[body_start..body_end]) catch return Error.OutOfMemory;
+            defer self.allocator.free(body_bytes);
+
+            // Truncate buffer back to body_start
+            self.codegen.emit.buf.shrinkRetainingCapacity(body_start);
+
+            // Emit prologue with exact frame size
+            const prologue_start = self.codegen.currentOffset();
+            const scaled_alloc: i7 = @intCast(@divExact(-frame_size, 8));
+            try self.codegen.emit.stpPreIndex(.w64, .FP, .LR, .ZRSP, scaled_alloc);
+            try self.codegen.emit.movRegReg(.w64, .FP, .ZRSP);
+
+            const prologue_size = self.codegen.currentOffset() - prologue_start;
+
+            // Re-append body
+            self.codegen.emit.buf.appendSlice(self.allocator, body_bytes) catch return Error.OutOfMemory;
+
+            // PHASE 3: Adjust relocation offsets
+            for (self.codegen.relocations.items[relocs_before..]) |*reloc| {
+                reloc.adjustOffset(prologue_size);
+            }
+
+            const func_end = self.codegen.currentOffset();
+
+            return ExportedSymbol{
+                .name = "",
+                .offset = prologue_start,
+                .size = func_end - prologue_start,
             };
         }
 

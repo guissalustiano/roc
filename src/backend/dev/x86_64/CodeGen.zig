@@ -324,9 +324,12 @@ pub const SystemVCodeGen = struct {
 
     // Stack management
 
+    /// Allocate stack space using the deferred prologue pattern.
+    /// stack_offset starts at 0 (or after reserved area) and grows more negative.
+    /// Final frame size is determined by -stack_offset after code generation.
     pub fn allocStack(self: *Self, size: u32) i32 {
-        const aligned_size = (size + 7) & ~@as(u32, 7);
-        self.stack_offset -= @intCast(aligned_size);
+        const aligned_size: i32 = @intCast((size + 7) & ~@as(u32, 7));
+        self.stack_offset -= aligned_size;
         return self.stack_offset;
     }
 
