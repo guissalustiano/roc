@@ -43,6 +43,11 @@ pub const StaticDataInterner = @import("StaticDataInterner.zig");
 /// Mono IR code generator for x86_64
 pub const MonoExprCodeGen = @import("MonoExprCodeGen.zig").MonoExprCodeGen;
 
+/// Native compiler for generating object files from Mono IR
+pub const NativeCompiler = @import("NativeCompiler.zig").NativeCompiler;
+pub const Entrypoint = @import("NativeCompiler.zig").Entrypoint;
+pub const CompilationResult = @import("NativeCompiler.zig").CompilationResult;
+
 /// Generic development backend parameterized by architecture-specific types.
 ///
 /// This struct provides the common code generation logic shared across
