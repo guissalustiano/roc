@@ -1072,14 +1072,8 @@ fn setupExternalCallTypeScope(
     call_expr_idx: CIR.Expr.Idx,
 ) Allocator.Error!void {
     // Get the external module
-    const ext_module_idx = caller_module_env.imports.getResolvedModule(lookup.module_idx) orelse {
-        std.debug.print("setupExternalCallTypeScope: import not resolved for module_idx={}\n", .{@intFromEnum(lookup.module_idx)});
-        return;
-    };
-    if (ext_module_idx >= self.all_module_envs.len) {
-        std.debug.print("setupExternalCallTypeScope: ext_module_idx={} out of bounds (len={})\n", .{ ext_module_idx, self.all_module_envs.len });
-        return;
-    }
+    const ext_module_idx = caller_module_env.imports.getResolvedModule(lookup.module_idx) orelse return;
+    if (ext_module_idx >= self.all_module_envs.len) return;
     const ext_module_env = self.all_module_envs[ext_module_idx];
 
     // Check if this is actually a def node (type modules with hosted functions may have different node types)
@@ -1642,15 +1636,8 @@ fn lowerExprInner(self: *Self, module_env: *ModuleEnv, expr: CIR.Expr, region: R
             // the platform's `requires` clause. E.g., `main!` in `requires { main! : ... }`
 
             // Get the app module index (set during lowerer initialization)
-            const app_idx = self.app_module_idx orelse {
-                std.debug.print("e_lookup_required: app_module_idx not set\n", .{});
-                break :blk .{ .runtime_error = {} };
-            };
-
-            if (app_idx >= self.all_module_envs.len) {
-                std.debug.print("e_lookup_required: app_module_idx {} out of bounds\n", .{app_idx});
-                break :blk .{ .runtime_error = {} };
-            }
+            const app_idx = self.app_module_idx orelse break :blk .{ .runtime_error = {} };
+            if (app_idx >= self.all_module_envs.len) break :blk .{ .runtime_error = {} };
 
             const app_env = self.all_module_envs[app_idx];
 
@@ -1676,10 +1663,7 @@ fn lowerExprInner(self: *Self, module_env: *ModuleEnv, expr: CIR.Expr, region: R
                 }
             }
 
-            if (found_def_idx == null or found_ident_idx == null) {
-                std.debug.print("e_lookup_required: '{s}' not found in app exports (exports.len={})\n", .{ required_name, exports.len });
-                break :blk .{ .runtime_error = {} };
-            }
+            if (found_def_idx == null or found_ident_idx == null) break :blk .{ .runtime_error = {} };
 
             // Create symbol for the app's export
             const symbol = MonoSymbol{
@@ -2134,24 +2118,15 @@ fn lowerExprInner(self: *Self, module_env: *ModuleEnv, expr: CIR.Expr, region: R
                 };
 
                 if (recv_nominal) |rn| {
-                    const origin_module_idx = self.findModuleForOrigin(recv_type_source_env, rn.origin) orelse {
-                        std.debug.print("e_dot_access method dispatch: could not find origin module\n", .{});
-                        unreachable;
-                    };
+                    const origin_module_idx = self.findModuleForOrigin(recv_type_source_env, rn.origin) orelse unreachable;
                     const origin_env = self.all_module_envs[origin_module_idx];
 
                     const qualified_method = origin_env.lookupMethodIdentFromTwoEnvsConst(
                         recv_type_source_env, rn.ident,
                         module_env, dot.field_name,
-                    ) orelse {
-                        std.debug.print("e_dot_access method dispatch: method lookup failed for {s}.{s}\n", .{ recv_type_source_env.getIdent(rn.ident), field_name });
-                        unreachable;
-                    };
+                    ) orelse unreachable;
 
-                    const node_idx = origin_env.getExposedNodeIndexById(qualified_method) orelse {
-                        std.debug.print("e_dot_access method dispatch: no exposed node for method\n", .{});
-                        unreachable;
-                    };
+                    const node_idx = origin_env.getExposedNodeIndexById(qualified_method) orelse unreachable;
 
                     // Check if the method definition is a low-level lambda
                     const method_def_idx: CIR.Def.Idx = @enumFromInt(node_idx);
@@ -2820,8 +2795,6 @@ fn lowerExprInner(self: *Self, module_env: *ModuleEnv, expr: CIR.Expr, region: R
             const type_var = ModuleEnv.varFrom(type_var_binding.type_var_anno);
             var resolved = module_env.types.resolveVar(type_var);
 
-            const method_name_str = module_env.getIdent(tvd.method_name);
-
             // Step 2: If flex/rigid, check type_scope for concrete mapping (polymorphic calls)
             var type_source_env: *const ModuleEnv = module_env;
             if (resolved.desc.content == .flex or resolved.desc.content == .rigid) {
@@ -2878,35 +2851,20 @@ fn lowerExprInner(self: *Self, module_env: *ModuleEnv, expr: CIR.Expr, region: R
                 else => null,
             };
 
-            const info = nominal_info orelse {
-                std.debug.print("e_type_var_dispatch: could not resolve to nominal/opaque type, content={s}\n", .{@tagName(resolved.desc.content)});
-                unreachable;
-            };
-
-            const origin_name = type_source_env.getIdent(info.origin);
-            const ident_name = type_source_env.getIdent(info.ident);
+            const info = nominal_info orelse unreachable;
 
             // Step 4: Find origin module index via imports
-            const origin_module_idx = self.findModuleForOrigin(type_source_env, info.origin) orelse {
-                std.debug.print("e_type_var_dispatch: could not find origin module\n", .{});
-                unreachable;
-            };
+            const origin_module_idx = self.findModuleForOrigin(type_source_env, info.origin) orelse unreachable;
             const origin_env = self.all_module_envs[origin_module_idx];
 
             // Step 5: Look up method in origin module (cross-ident-store lookup)
             const qualified_method = origin_env.lookupMethodIdentFromTwoEnvsConst(
                 type_source_env, info.ident,
                 module_env, tvd.method_name,
-            ) orelse {
-                std.debug.print("e_type_var_dispatch: method lookup failed for origin={s} ident={s} method={s}\n", .{ origin_name, ident_name, method_name_str });
-                unreachable;
-            };
+            ) orelse unreachable;
 
             // Get the node index for the method definition
-            const node_idx = origin_env.getExposedNodeIndexById(qualified_method) orelse {
-                std.debug.print("e_type_var_dispatch: no exposed node for method\n", .{});
-                unreachable;
-            };
+            const node_idx = origin_env.getExposedNodeIndexById(qualified_method) orelse unreachable;
 
             // Step 6: Lower as external definition + lookup/call
             const symbol = MonoSymbol{
@@ -2951,10 +2909,7 @@ fn lowerExprInner(self: *Self, module_env: *ModuleEnv, expr: CIR.Expr, region: R
             }
         },
 
-        else => {
-            std.debug.print("UNHANDLED EXPR TYPE in Lower.zig: {s}\n", .{@tagName(expr)});
-            unreachable;
-        },
+        else => unreachable,
     };
 
     return self.store.addExpr(mono_expr, region);
